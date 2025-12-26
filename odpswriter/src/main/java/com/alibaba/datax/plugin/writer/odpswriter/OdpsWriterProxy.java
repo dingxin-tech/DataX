@@ -51,6 +51,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TimeZone;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class OdpsWriterProxy {
     private static final Logger LOG = LoggerFactory.getLogger(OdpsWriterProxy.class);
@@ -96,6 +100,37 @@ public class OdpsWriterProxy {
     // 读取 jvm 默认时区
     private Calendar calendarForDate = null;
     private boolean useDateWithCalendar = true;
+
+    // ========== 异步flush相关字段 ==========
+    /**
+     * 是否启用异步flush
+     */
+    private boolean enableAsyncFlush = false;
+
+    /**
+     * 双缓冲区：当前写入的buffer
+     */
+    private ProtobufRecordPack currentBuffer;
+
+    /**
+     * 双缓冲区：备用buffer（用于交换）
+     */
+    private ProtobufRecordPack backupBuffer;
+
+    /**
+     * 异步flush线程池
+     */
+    private ExecutorService flushExecutor;
+
+    /**
+     * 上一个异步flush的future（双缓冲区下最多只有一个在执行）
+     */
+    private CompletableFuture<Long> lastFlushFuture = null;
+
+    /**
+     * 异步flush异常（如果发生）
+     */
+    private AtomicReference<Exception> asyncFlushException = new AtomicReference<>(null);
 
     private Calendar initCalendar(Configuration config) {
         // 理论上不会有其他选择，有配置化可以随时应急
@@ -151,6 +186,9 @@ public class OdpsWriterProxy {
         
         this.calendarForDate = this.initCalendar(taskConfig);
         this.useDateWithCalendar = taskConfig.getBool("useDateWithCalendar", true);
+
+        // 初始化异步flush配置
+        this.initAsyncFlush(taskConfig, blockSizeInMB, initBufSizeZero);
     }
 
     public OdpsWriterProxy(TableTunnel.UploadSession slaveUpload, int blockSizeInMB, AtomicLong blockId, int taskId,
@@ -186,6 +224,44 @@ public class OdpsWriterProxy {
         
         this.calendarForDate = this.initCalendar(taskConfig);
         this.useDateWithCalendar = taskConfig.getBool("useDateWithCalendar", true);
+
+        // 初始化异步flush配置
+        this.initAsyncFlush(taskConfig, blockSizeInMB, false);
+    }
+
+    /**
+     * 初始化异步flush相关配置和双缓冲区
+     */
+    private void initAsyncFlush(Configuration taskConfig, int blockSizeInMB, boolean initBufSizeZero) 
+            throws IOException, TunnelException {
+        this.enableAsyncFlush = taskConfig.getBool(Key.ENABLE_ASYNC_FLUSH, false);
+
+        if (this.enableAsyncFlush) {
+            // 初始化双缓冲区
+            if (initBufSizeZero) {
+                this.currentBuffer = new ProtobufRecordPack(this.schema, null, 0);
+                this.backupBuffer = new ProtobufRecordPack(this.schema, null, 0);
+            } else {
+                this.currentBuffer = new ProtobufRecordPack(this.schema, null, blockSizeInMB * 1024 * 1024);
+                this.backupBuffer = new ProtobufRecordPack(this.schema, null, blockSizeInMB * 1024 * 1024);
+            }
+            // 使用当前buffer作为主buffer（兼容原有逻辑）
+            this.protobufRecordPack = this.currentBuffer;
+
+            // 初始化异步flush线程池（单线程，保证顺序）
+            this.flushExecutor = Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "OdpsWriterProxy-AsyncFlush-" + System.identityHashCode(this));
+                t.setDaemon(true);
+                return t;
+            });
+
+            LOG.info("Async flush enabled with double buffering");
+        } else {
+            // 同步模式，使用原有逻辑
+            this.currentBuffer = null;
+            this.backupBuffer = null;
+            this.flushExecutor = null;
+        }
     }
 
     public long getCurrentBlockId() {
@@ -205,6 +281,13 @@ public class OdpsWriterProxy {
 
         this.lastActiveTime = System.currentTimeMillis();
 
+        // 检查是否有异步flush异常
+        Exception asyncException = asyncFlushException.get();
+        if (asyncException != null) {
+            throw DataXException.asDataXException(OdpsWriterErrorCode.WRITER_RECORD_FAIL, 
+                    "Async flush failed, cannot continue writing", asyncException);
+        }
+
         Record record = dataxRecordToOdpsRecord(dataXRecord);
 
         if (null == record) {
@@ -213,38 +296,160 @@ public class OdpsWriterProxy {
         protobufRecordPack.append(record);
 
         if (protobufRecordPack.getProtobufStream().size() >= maxBufferSize) {
-            long startTimeInNs = System.nanoTime();
-            OdpsUtil.slaveWriteOneBlock(this.slaveUpload, protobufRecordPack, getCurrentBlockId(), this.writeTimeoutInMs);
-            LOG.info("write block {} ok.", getCurrentBlockId());
-            blocks.add(getCurrentBlockId());
-            protobufRecordPack.reset();
-            this.blockId.incrementAndGet();
-            return System.nanoTime() - startTimeInNs;
+            if (enableAsyncFlush) {
+                return flushAsync(blocks);
+            } else {
+                return flushSync(blocks);
+            }
         }
         return 0;
     }
 
+    /**
+     * 同步flush（原有逻辑）
+     */
+    private long flushSync(List<Long> blocks) throws Exception {
+        long startTimeInNs = System.nanoTime();
+        long currentBlockId = getCurrentBlockId();
+        
+        OdpsUtil.slaveWriteOneBlock(this.slaveUpload, protobufRecordPack, currentBlockId, this.writeTimeoutInMs);
+        
+        LOG.info("write block {} ok", currentBlockId);
+        blocks.add(currentBlockId);
+        protobufRecordPack.reset();
+        this.blockId.incrementAndGet();
+        
+        return System.nanoTime() - startTimeInNs;
+    }
+
+    /**
+     * 异步flush（双缓冲）
+     * 双缓冲区下，最多只有一个flush在执行，所以只需要等待上一个flush完成即可
+     */
+    private long flushAsync(List<Long> blocks) throws Exception {
+        long startTimeInNs = System.nanoTime();
+        long currentBlockId = getCurrentBlockId();
+        
+        // 如果上一个flush还在执行，等待它完成（双缓冲区下最多只有一个在执行）
+        if (lastFlushFuture != null && !lastFlushFuture.isDone()) {
+            try {
+                lastFlushFuture.get(); // 阻塞等待上一个flush完成
+            } catch (Exception e) {
+                LOG.error("Error waiting for previous async flush to complete", e);
+                throw DataXException.asDataXException(OdpsWriterErrorCode.WRITER_RECORD_FAIL, 
+                        "Previous async flush failed", e);
+            }
+        }
+        
+        // 交换buffer：当前buffer用于flush，备用buffer用于继续写入
+        ProtobufRecordPack flushBuffer = currentBuffer;
+        currentBuffer = backupBuffer;
+        backupBuffer = flushBuffer;
+        
+        // 更新protobufRecordPack指向新的当前buffer
+        protobufRecordPack = currentBuffer;
+        
+        // 重置新的当前buffer
+        currentBuffer.reset();
+        
+        // 异步flush
+        lastFlushFuture = CompletableFuture.supplyAsync(() -> {
+            try {
+                OdpsUtil.slaveWriteOneBlock(slaveUpload, flushBuffer, currentBlockId, writeTimeoutInMs);
+                LOG.info("async write block {} ok", currentBlockId);
+                return currentBlockId;
+            } catch (Exception e) {
+                // 记录异常，后续写入会检查并抛出
+                asyncFlushException.compareAndSet(null, e);
+                LOG.error("Async flush failed for block {}", currentBlockId, e);
+                throw new RuntimeException("Async flush failed", e);
+            }
+        }, flushExecutor);
+        
+        blocks.add(currentBlockId);
+        this.blockId.incrementAndGet();
+        
+        return System.nanoTime() - startTimeInNs;
+    }
+
     public long writeRemainingRecord(List<Long> blocks) throws Exception {
-        // complete protobuf stream, then write to http
-        // protobufRecordPack.getTotalBytes() 慕明: getTotalBytes并不一定保证能拿到写入的字节数，按你们的逻辑应该是用getTotalBytesWritten
-        // if (protobufRecordPack.getTotalBytes() != 0) {
+        long totalTime = 0;
+        
+        // 检查是否有异步flush异常
+        Exception asyncException = asyncFlushException.get();
+        if (asyncException != null) {
+            throw DataXException.asDataXException(OdpsWriterErrorCode.WRITER_RECORD_FAIL, 
+                    "Async flush failed, cannot continue", asyncException);
+        }
+        
+        // 如果有剩余数据，先flush
         boolean hasRemindData = false;
         if (this.checkWithGetSize) {
             hasRemindData = protobufRecordPack.getSize() != 0;
         } else {
             hasRemindData = protobufRecordPack.getTotalBytes() != 0;
         }
+        
         if (hasRemindData) {
-            long startTimeInNs = System.nanoTime();
-            OdpsUtil.slaveWriteOneBlock(this.slaveUpload, protobufRecordPack, getCurrentBlockId(), this.writeTimeoutInMs);
-            LOG.info("write block {} ok.", getCurrentBlockId());
-
-            blocks.add(getCurrentBlockId());
-            // reset the buffer for next block
+            long currentBlockId = getCurrentBlockId();
+            
+            if (enableAsyncFlush) {
+                // 如果上一个flush还在执行，等待它完成
+                if (lastFlushFuture != null && !lastFlushFuture.isDone()) {
+                    try {
+                        lastFlushFuture.get();
+                    } catch (Exception e) {
+                        LOG.error("Error waiting for previous async flush to complete", e);
+                        throw DataXException.asDataXException(OdpsWriterErrorCode.WRITER_RECORD_FAIL, 
+                                "Previous async flush failed", e);
+                    }
+                }
+                
+                // 异步flush剩余数据
+                lastFlushFuture = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        OdpsUtil.slaveWriteOneBlock(slaveUpload, protobufRecordPack, currentBlockId, writeTimeoutInMs);
+                        LOG.info("async write remaining block {} ok", currentBlockId);
+                        return currentBlockId;
+                    } catch (Exception e) {
+                        asyncFlushException.compareAndSet(null, e);
+                        LOG.error("Async flush failed for remaining block {}", currentBlockId, e);
+                        throw new RuntimeException("Async flush failed", e);
+                    }
+                }, flushExecutor);
+                
+                blocks.add(currentBlockId);
+            } else {
+                // 同步flush剩余数据
+                long startTimeInNs = System.nanoTime();
+                OdpsUtil.slaveWriteOneBlock(this.slaveUpload, protobufRecordPack, currentBlockId, this.writeTimeoutInMs);
+                LOG.info("write remaining block {} ok", currentBlockId);
+                blocks.add(currentBlockId);
+                totalTime += System.nanoTime() - startTimeInNs;
+            }
+            
             protobufRecordPack.reset();
-            return System.nanoTime() - startTimeInNs;
         }
-        return 0;
+        
+        // 等待最后一个异步flush完成（双缓冲区下最多只有一个）
+        if (enableAsyncFlush && lastFlushFuture != null && !lastFlushFuture.isDone()) {
+            LOG.info("Waiting for last async flush to complete");
+            try {
+                lastFlushFuture.get(); // 阻塞等待完成
+                LOG.info("Last async flush completed");
+            } catch (Exception e) {
+                LOG.error("Error waiting for async flush to complete", e);
+                throw DataXException.asDataXException(OdpsWriterErrorCode.WRITER_RECORD_FAIL, 
+                        "Async flush failed", e);
+            }
+        }
+        
+        // 关闭flush线程池
+        if (flushExecutor != null && !flushExecutor.isShutdown()) {
+            flushExecutor.shutdown();
+        }
+        
+        return totalTime;
     }
 
     public Record dataxRecordToOdpsRecord(com.alibaba.datax.common.element.Record dataXRecord) throws Exception {
@@ -1088,5 +1293,26 @@ public class OdpsWriterProxy {
 
     public Long getCurrentTotalBytes() throws IOException {
         return this.protobufRecordPack.getTotalBytes();
+    }
+
+    /**
+     * 关闭异步flush相关资源
+     * 应该在所有写入完成后调用
+     */
+    public void close() {
+        if (flushExecutor != null && !flushExecutor.isShutdown()) {
+            flushExecutor.shutdown();
+            try {
+                // 等待最多5秒
+                if (!flushExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                    LOG.warn("Async flush executor did not terminate in time, forcing shutdown");
+                    flushExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                LOG.warn("Interrupted while waiting for async flush executor to terminate", e);
+                flushExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 }

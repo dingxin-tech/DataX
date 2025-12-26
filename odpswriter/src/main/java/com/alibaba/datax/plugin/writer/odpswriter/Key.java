@@ -85,4 +85,10 @@ public final class Key {
 
     //动态分区写入模式下，内存使用率达到80%则flush时间间隔，单位分钟
     public static final String DYNAMIC_PARTITION_MEM_USAGE_FLUSH_INTERVAL_IN_MINUTE = "dynamicPartitionMemUsageFlushIntervalInMinute";
+
+    /**
+     * 是否启用异步flush，默认false（同步模式）
+     * 启用后使用双缓冲区，在后台异步flush，提高写入性能
+     */
+    public static final String ENABLE_ASYNC_FLUSH = "enableAsyncFlush";
 }
